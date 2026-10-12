@@ -1,0 +1,10 @@
+variable "aws_region"       { type = string; default = "us-east-1" }
+variable "project_name"     { type = string; default = "gdars" }
+variable "environment"      { type = string; default = "production" }
+variable "groq_api_key"     { type = string; sensitive = true }
+variable "tavily_api_key"   { type = string; sensitive = true }
+variable "alert_email"      { type = string; default = "" }
+variable "task_cpu"         { type = number; default = 1024 }
+variable "task_memory"      { type = number; default = 2048 }
+variable "desired_count"    { type = number; default = 1 }
+variable "max_capacity"     { type = number; default = 4 }

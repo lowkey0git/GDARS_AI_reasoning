@@ -1,0 +1,206 @@
+name: GDARS v2 CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION:     us-east-1
+  ECR_REPOSITORY: gdars
+  ECS_CLUSTER:    gdars-cluster
+  ECS_SERVICE:    gdars-service
+  CONTAINER_NAME: gdars-api
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: Test — runs on every push and PR
+  # ─────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create required directories
+        run: mkdir -p data/faiss_index data/chroma logs
+
+      - name: Write test environment
+        run: |
+          printf 'GROQ_API_KEY=test-key\nRETRIEVAL_TAVILY_API_KEY=\nMEMORY_REDIS_URL=redis://localhost:6379/0\nENVIRONMENT=development\nAPI_LOG_LEVEL=WARNING\n' > .env
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v --tb=short -x \
+            --cov=agents --cov=memory --cov=tools --cov=evaluation --cov=utils \
+            --cov-report=xml --cov-report=term-missing
+        env:
+          PYTHONPATH: .
+          GROQ_API_KEY: test-key
+          RETRIEVAL_TAVILY_API_KEY: ""
+          MEMORY_REDIS_URL: redis://localhost:6379/0
+          ENVIRONMENT: development
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: Build — push only, after tests pass
+  # ─────────────────────────────────────────────────────────────
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        env:
+          REGISTRY:  ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha && github.sha[:8] || 'latest' }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          TAG="${{ github.ref_name }}-${SHORT_SHA}"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          LATEST="${REGISTRY}/${ECR_REPOSITORY}:latest"
+          docker buildx build \
+            --platform linux/amd64 \
+            --cache-from type=gha \
+            --cache-to   type=gha,mode=max \
+            -t "$IMAGE" -t "$LATEST" --push .
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3: Deploy — main branch only
+  # ─────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: ${{ steps.alb.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition gdars-task \
+            --query taskDefinition > task-definition.json
+
+      - name: Inject new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name:  ${{ env.CONTAINER_NAME }}
+          image:           ${{ needs.build.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:            ${{ steps.task-def.outputs.task-definition }}
+          service:                    ${{ env.ECS_SERVICE }}
+          cluster:                    ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes:           10
+
+      - name: Get ALB URL
+        id: alb
+        run: |
+          URL=$(aws elbv2 describe-load-balancers \
+            --names gdars-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>/dev/null || echo "pending")
+          echo "url=http://${URL}" >> "$GITHUB_OUTPUT"
+          echo "Deployed: http://${URL}"
+
+      - name: Smoke test — /ready endpoint
+        run: |
+          sleep 20
+          URL="${{ steps.alb.outputs.url }}"
+          curl --fail --retry 5 --retry-delay 10 "${URL}/ready" \
+            | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d.get('status') == 'ready', f'Not ready: {d}'
+          print('Smoke test passed:', d)
+          "
+
+      - name: Smoke test — /health endpoint
+        run: |
+          curl --fail "${{ steps.alb.outputs.url }}/health" \
+            | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d.get('status') == 'ok', f'Health failed: {d}'
+          print('Health check passed:', d)
+          "
+
+      - name: On failure
+        if: failure()
+        run: |
+          echo "::error::Deploy failed for ${{ github.sha }}"
+          echo "ECS logs: https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/${{ env.ECS_CLUSTER }}"

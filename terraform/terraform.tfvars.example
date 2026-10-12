@@ -1,0 +1,10 @@
+aws_region      = "us-east-1"
+project_name    = "gdars"
+environment     = "production"
+groq_api_key    = "gsk_..."
+tavily_api_key  = "tvly-..."
+alert_email     = "you@example.com"
+task_cpu        = 1024
+task_memory     = 2048
+desired_count   = 1
+max_capacity    = 4
